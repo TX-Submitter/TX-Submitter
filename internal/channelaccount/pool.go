@@ -23,45 +23,14 @@ func New(store state.Store) *Pool {
 }
 
 // Acquire claims an active channel account under concurrent load.
-// It uses SELECT FOR UPDATE SKIP LOCKED semantics to avoid double-assignment.
-// Returns an error if no accounts are available.
+// The underlying store uses SELECT FOR UPDATE SKIP LOCKED so that concurrent
+// callers never receive the same account. Returns an error if none available.
 func (p *Pool) Acquire(ctx context.Context) (*state.ChannelAccount, error) {
-	const sql = `
-	SELECT id, secret_key, public_key, current_seq, is_active, created_at
-	FROM channel_accounts
-	WHERE is_active = true
-	ORDER BY current_seq ASC
-	FOR UPDATE SKIP LOCKED
-	LIMIT 1`
-
-	rows, err := p.store.ListChannelAccounts(ctx, true)
+	ca, err := p.store.AcquireChannelAccount(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing channel accounts: %w", err)
+		return nil, fmt.Errorf("acquiring channel account: %w", err)
 	}
-
-	// Find the account with the lowest sequence number that is active
-	// and not currently being used (current_seq is the latest sequence used,
-	// we need to track in-use state separately — for now, use the DB query pattern)
-	var best *state.ChannelAccount
-	for _, ca := range rows {
-		if best == nil || ca.CurrentSeq < best.CurrentSeq {
-			best = ca
-		}
-	}
-
-	if best == nil {
-		return nil, fmt.Errorf("no available channel accounts in pool")
-	}
-
-	// Increment the sequence number to claim this account
-	nextSeq := best.CurrentSeq + 1
-	err = p.store.UpdateChannelAccountSeq(ctx, best.PublicKey, nextSeq)
-	if err != nil {
-		return nil, fmt.Errorf("updating channel account sequence: %w", err)
-	}
-
-	best.CurrentSeq = nextSeq
-	return best, nil
+	return ca, nil
 }
 
 // Release marks a channel account as available for reuse.
@@ -115,21 +84,14 @@ func (p *Pool) RemoveAccount(ctx context.Context, publicKey string) error {
 	return p.store.DeactivateChannelAccount(ctx, publicKey)
 }
 
-// InitPopulates the pool with the configured number of channel accounts if empty.
-// Each account is generated from the secret key derivation.
+// InitPool seeds the pool with the given channel account secret seeds. It is
+// idempotent: the underlying store upserts on public_key, so re-seeding an
+// already-present account preserves its current_seq and never creates a
+// duplicate. Safe to call on every startup.
 func (p *Pool) InitPool(ctx context.Context, secretKeys []string) error {
-	existing, err := p.store.ListChannelAccounts(ctx, true)
-	if err != nil {
-		return fmt.Errorf("checking pool: %w", err)
-	}
-	if len(existing) >= len(secretKeys) {
-		return nil // pool already initialized
-	}
-
 	for _, sk := range secretKeys {
-		_, err := p.AddAccount(ctx, sk)
-		if err != nil {
-			return fmt.Errorf("adding channel account: %w", err)
+		if _, err := p.AddAccount(ctx, sk); err != nil {
+			return fmt.Errorf("seeding channel account: %w", err)
 		}
 	}
 	return nil

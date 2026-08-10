@@ -15,6 +15,7 @@ type Config struct {
 	NetworkPassphrase             string
 	DistributionAccountSecret     string
 	NumChannelAccounts            int
+	ChannelAccountStartingBalance string
 	DatabaseURL                   string
 	MaxBaseFee                    int64
 	RetryMaxAttempts              int
@@ -59,6 +60,15 @@ func loadInt64(key string, defaultValue int64) int64 {
 	return n
 }
 
+// loadString reads an env var, returns defaultValue if empty.
+func loadString(key, defaultValue string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue
+	}
+	return val
+}
+
 // Load reads all environment variables and returns a validated Config.
 // It panics on any missing required variable or invalid value.
 func Load() Config {
@@ -67,12 +77,13 @@ func Load() Config {
 		NetworkPassphrase:             loadRequired("NETWORK_PASSPHRASE"),
 		DistributionAccountSecret:     loadRequired("DISTRIBUTION_ACCOUNT_SECRET"),
 		NumChannelAccounts:            loadInt("NUM_CHANNEL_ACCOUNTS", 2),
+		ChannelAccountStartingBalance: loadString("CHANNEL_ACCOUNT_STARTING_BALANCE", "2"),
 		DatabaseURL:                   loadRequired("DATABASE_URL"),
 		MaxBaseFee:                    loadInt64("MAX_BASE_FEE", 10000),
 		RetryMaxAttempts:              loadInt("RETRY_MAX_ATTEMPTS", 5),
 		QueuePollingInterval:          time.Duration(loadInt("QUEUE_POLLING_INTERVAL_SECONDS", 6)) * time.Second,
 		HTTPPort:                      loadInt("HTTP_PORT", 8080),
 		MetricsPort:                   loadInt("METRICS_PORT", 9002),
-		LogLevel:                      loadInt("LOG_LEVEL", "INFO"),
+		LogLevel:                      loadString("LOG_LEVEL", "INFO"),
 	}
 }

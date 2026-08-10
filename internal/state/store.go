@@ -9,13 +9,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
+	"github.com/stellar/go-stellar-sdk/keypair"
 )
 
 var (
-	ErrNotFound      = errors.New("transaction not found")
-	ErrAlreadyExists = errors.New("transaction external id already exists")
-	ErrTerminalState = errors.New("transaction is in a terminal state")
+	ErrNotFound          = errors.New("transaction not found")
+	ErrAlreadyExists     = errors.New("transaction external id already exists")
+	ErrTerminalState     = errors.New("transaction is in a terminal state")
+	ErrNoChannelAccounts = errors.New("no available channel accounts in pool")
 )
 
 // Status represents the lifecycle state of a transaction.
@@ -98,20 +101,21 @@ type Store interface {
 	MarkChannelUsed(ctx context.Context, txID, channelPublicKey string) error
 
 	// Channel account pool
+	AcquireChannelAccount(ctx context.Context) (*ChannelAccount, error)
 	CreateChannelAccount(ctx context.Context, secretKey string) (*ChannelAccount, error)
 	ListChannelAccounts(ctx context.Context, activeOnly bool) ([]*ChannelAccount, error)
 	UpdateChannelAccountSeq(ctx context.Context, publicKey string, seq int64) error
 	DeactivateChannelAccount(ctx context.Context, publicKey string) error
 }
 
-// txStore wraps pgx.Conn and provides transactional query execution.
+// txStore wraps pgxpool.Pool and provides transactional query execution.
 type txStore struct {
-	conn *pgx.Conn
+	pool *pgxpool.Pool
 }
 
-// New creates a new Store backed by the given pgx.Conn.
-func New(conn *pgx.Conn) Store {
-	return &txStore{conn: conn}
+// New creates a new Store backed by the given pgxpool.Pool.
+func New(pool *pgxpool.Pool) Store {
+	return &txStore{pool: pool}
 }
 
 // --- Transaction Operations ---
@@ -124,7 +128,7 @@ RETURNING id, external_id, source_account, destination, amount, asset_code, asse
 
 func (s *txStore) CreateTransaction(ctx context.Context, params NewTransactionParams) (*Transaction, error) {
 	var tx Transaction
-	err := s.conn.QueryRow(ctx, createTransactionSQL,
+	err := s.pool.QueryRow(ctx, createTransactionSQL,
 		params.ExternalID,
 		params.SourceAccount,
 		params.Destination,
@@ -153,7 +157,7 @@ func (s *txStore) GetTransaction(ctx context.Context, id string) (*Transaction, 
 	var tx Transaction
 	var horizonTxID, errMsg *string
 
-	err := s.conn.QueryRow(ctx, getTransactionSQL, id).Scan(
+	err := s.pool.QueryRow(ctx, getTransactionSQL, id).Scan(
 		&tx.ID, &tx.ExternalID, &tx.SourceAccount, &tx.Destination,
 		&tx.Amount, &tx.AssetCode, &tx.AssetIssuer,
 		&tx.ChannelAccount, &tx.Status,
@@ -180,7 +184,7 @@ func (s *txStore) GetByExternalID(ctx context.Context, externalID string) (*Tran
 	var tx Transaction
 	var horizonTxID, errMsg *string
 
-	err := s.conn.QueryRow(ctx, getByExternalIDSQL, externalID).Scan(
+	err := s.pool.QueryRow(ctx, getByExternalIDSQL, externalID).Scan(
 		&tx.ID, &tx.ExternalID, &tx.SourceAccount, &tx.Destination,
 		&tx.Amount, &tx.AssetCode, &tx.AssetIssuer,
 		&tx.ChannelAccount, &tx.Status,
@@ -206,7 +210,7 @@ ORDER BY created_at ASC
 LIMIT $1`
 
 func (s *txStore) ListPending(ctx context.Context, limit int) ([]*Transaction, error) {
-	rows, err := s.conn.Query(ctx, listPendingSQL, limit)
+	rows, err := s.pool.Query(ctx, listPendingSQL, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +248,7 @@ VALUES ($1, $2, $3, $4)`
 
 func (s *txStore) UpdateStatus(ctx context.Context, txID string, newStatus Status, detail string, horizonTxID *string) error {
 	var currentStatus Status
-	err := s.conn.QueryRow(ctx, "SELECT status FROM transactions WHERE id = $1", txID).Scan(&currentStatus)
+	err := s.pool.QueryRow(ctx, "SELECT status FROM transactions WHERE id = $1", txID).Scan(&currentStatus)
 	if err == pgx.ErrNoRows {
 		return ErrNotFound
 	}
@@ -256,7 +260,7 @@ func (s *txStore) UpdateStatus(ctx context.Context, txID string, newStatus Statu
 		return ErrTerminalState
 	}
 
-	tx, err := s.conn.Begin(ctx)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
@@ -283,7 +287,7 @@ WHERE transaction_id = $1
 ORDER BY attempted_at ASC`
 
 func (s *txStore) TransitionHistory(ctx context.Context, txID string) ([]*Transition, error) {
-	rows, err := s.conn.Query(ctx, transitionHistorySQL, txID)
+	rows, err := s.pool.Query(ctx, transitionHistorySQL, txID)
 	if err != nil {
 		return nil, err
 	}
@@ -315,21 +319,71 @@ SET channel_account = $2, updated_at = now()
 WHERE id = $1 AND status = 'pending'`
 
 func (s *txStore) MarkChannelUsed(ctx context.Context, txID, channelPublicKey string) error {
-	_, err := s.conn.Exec(ctx, markChannelUsedSQL, txID, channelPublicKey)
+	_, err := s.pool.Exec(ctx, markChannelUsedSQL, txID, channelPublicKey)
 	return err
 }
 
 // --- Channel Account Operations ---
 
+const acquireChannelAccountSQL = `
+SELECT id, secret_key, public_key, current_seq, is_active, created_at
+FROM channel_accounts
+WHERE is_active = true
+ORDER BY current_seq ASC
+FOR UPDATE SKIP LOCKED
+LIMIT 1`
+
+// AcquireChannelAccount atomically claims the least-recently-used active channel
+// account. The FOR UPDATE SKIP LOCKED clause holds a row lock for the duration
+// of the transaction so concurrent callers skip locked rows and never receive
+// the same account. The sequence is bumped and the lock released on commit.
+func (s *txStore) AcquireChannelAccount(ctx context.Context) (*ChannelAccount, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning acquire transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var ca ChannelAccount
+	err = tx.QueryRow(ctx, acquireChannelAccountSQL).Scan(
+		&ca.ID, &ca.SecretKey, &ca.PublicKey,
+		&ca.CurrentSeq, &ca.IsActive, &ca.CreatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, ErrNoChannelAccounts
+	}
+	if err != nil {
+		return nil, fmt.Errorf("selecting channel account: %w", err)
+	}
+
+	nextSeq := ca.CurrentSeq + 1
+	_, err = tx.Exec(ctx, updateChannelAccountSeqSQL, ca.PublicKey, nextSeq)
+	if err != nil {
+		return nil, fmt.Errorf("bumping channel account sequence: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing acquire: %w", err)
+	}
+
+	ca.CurrentSeq = nextSeq
+	return &ca, nil
+}
+
 const createChannelAccountSQL = `
 INSERT INTO channel_accounts (secret_key, public_key, current_seq)
 VALUES ($1, $2, $3)
+ON CONFLICT (public_key) DO UPDATE SET secret_key = EXCLUDED.secret_key
 RETURNING id, secret_key, public_key, current_seq, is_active, created_at`
 
 func (s *txStore) CreateChannelAccount(ctx context.Context, secretKey string) (*ChannelAccount, error) {
+	kp, err := keypair.ParseFull(secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid channel account secret: %w", err)
+	}
 	var ca ChannelAccount
-	err := s.conn.QueryRow(ctx, createChannelAccountSQL,
-		secretKey, "placeholder_pub", int64(0),
+	err = s.pool.QueryRow(ctx, createChannelAccountSQL,
+		secretKey, kp.Address(), int64(0),
 	).Scan(
 		&ca.ID, &ca.SecretKey, &ca.PublicKey,
 		&ca.CurrentSeq, &ca.IsActive, &ca.CreatedAt,
@@ -347,7 +401,7 @@ WHERE $1 = true OR is_active = true
 ORDER BY created_at ASC`
 
 func (s *txStore) ListChannelAccounts(ctx context.Context, activeOnly bool) ([]*ChannelAccount, error) {
-	rows, err := s.conn.Query(ctx, listChannelAccountsSQL, activeOnly)
+	rows, err := s.pool.Query(ctx, listChannelAccountsSQL, activeOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +427,7 @@ const updateChannelAccountSeqSQL = `
 UPDATE channel_accounts SET current_seq = $2 WHERE public_key = $1`
 
 func (s *txStore) UpdateChannelAccountSeq(ctx context.Context, publicKey string, seq int64) error {
-	_, err := s.conn.Exec(ctx, updateChannelAccountSeqSQL, publicKey, seq)
+	_, err := s.pool.Exec(ctx, updateChannelAccountSeqSQL, publicKey, seq)
 	return err
 }
 
@@ -381,6 +435,6 @@ const deactivateChannelAccountSQL = `
 UPDATE channel_accounts SET is_active = false WHERE public_key = $1`
 
 func (s *txStore) DeactivateChannelAccount(ctx context.Context, publicKey string) error {
-	_, err := s.conn.Exec(ctx, deactivateChannelAccountSQL, publicKey)
+	_, err := s.pool.Exec(ctx, deactivateChannelAccountSQL, publicKey)
 	return err
 }

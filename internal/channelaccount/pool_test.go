@@ -74,6 +74,19 @@ func (m *testMockStore) DeactivateChannelAccount(ctx context.Context, publicKey 
 	ca.IsActive = false
 	return nil
 }
+func (m *testMockStore) AcquireChannelAccount(ctx context.Context) (*state.ChannelAccount, error) {
+	var best *state.ChannelAccount
+	for _, ca := range m.accounts {
+		if ca.IsActive && (best == nil || ca.CurrentSeq < best.CurrentSeq) {
+			best = ca
+		}
+	}
+	if best == nil {
+		return nil, state.ErrNoChannelAccounts
+	}
+	best.CurrentSeq++
+	return best, nil
+}
 
 func TestPool_Acquire_ReturnsAccount(t *testing.T) {
 	ctx := context.Background()
