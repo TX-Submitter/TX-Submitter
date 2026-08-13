@@ -66,9 +66,10 @@ func IncrementSubmission(status string) {
 	SubmissionCount.WithLabelValues(status).Inc()
 }
 
-// ObserveSubmitLatency records a submission latency observation.
-func ObserveSubmitLatency(seconds float64) {
-	SubmitLatency.WithLabelValues("success").Observe(seconds)
+// ObserveSubmitLatency records a submission latency observation for the given
+// outcome status (e.g. "confirmed", "submitted", "failed").
+func ObserveSubmitLatency(seconds float64, status string) {
+	SubmitLatency.WithLabelValues(status).Observe(seconds)
 }
 
 // IncrementDeadLetters increments the dead letter counter.

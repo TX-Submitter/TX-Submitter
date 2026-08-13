@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gamp/stellar-tx-submitter/internal/metrics"
@@ -13,7 +14,6 @@ import (
 	"github.com/gamp/stellar-tx-submitter/internal/channelaccount"
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
-	"github.com/stellar/go-stellar-sdk/protocols/horizon"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 )
 
@@ -86,10 +86,12 @@ func (e *Engine) currentLedgerBound() uint32 {
 }
 
 // SubmitProcess builds, signs, submits, and polls one pending transaction.
-func (e *Engine) SubmitProcess(ctx context.Context, tx *state.Transaction) error {
+func (e *Engine) SubmitProcess(ctx context.Context, tx *state.Transaction) (err error) {
 	start := time.Now()
+	outcome := "failed"
 	defer func() {
-		metrics.ObserveSubmitLatency(time.Since(start).Seconds())
+		metrics.ObserveSubmitLatency(time.Since(start).Seconds(), outcome)
+		metrics.IncrementSubmission(outcome)
 	}()
 
 	// Acquire a channel account from the pool
@@ -107,11 +109,44 @@ func (e *Engine) SubmitProcess(ctx context.Context, tx *state.Transaction) error
 		return fmt.Errorf("marking channel used: %w", err)
 	}
 
-	// Build the transaction via the shared builder so LedgerBounds and fee
-	// capping stay consistent between initial submission and fee-bumps.
+	starTx, err := e.buildSignedPayment(ctx, tx, ca, e.retryPolicy.CurrentFee(0))
+	if err != nil {
+		return fmt.Errorf("building transaction: %w", err)
+	}
+
+	// Submit to Horizon
+	horizonResp, err := e.horizon.SubmitTransaction(starTx)
+	if err != nil {
+		err = e.handleSubmissionError(ctx, tx, ca, err)
+		if err == nil {
+			outcome = "submitted"
+		}
+		return err
+	}
+
+	// Record submitted state
+	horizonID := horizonResp.Hash
+	err = e.store.UpdateStatus(ctx, tx.ID, state.StatusSubmitted, "submitted to horizon", &horizonID)
+	if err != nil {
+		return fmt.Errorf("updating status to submitted: %w", err)
+	}
+
+	// Poll for inclusion confirmation
+	err = e.pollForConfirmation(ctx, tx.ID, ca.PublicKey, horizonID)
+	if err == nil {
+		outcome = "confirmed"
+	}
+	return err
+}
+
+// buildSignedPayment builds a payment from the channel account and signs it
+// with the channel key and, if the funding source is a different account,
+// the source account key too. Shared by the initial submission and by the
+// tx_bad_seq resubmission path so both build from identical parameters.
+func (e *Engine) buildSignedPayment(ctx context.Context, tx *state.Transaction, ca *state.ChannelAccount, baseFee int64) (*txnbuild.Transaction, error) {
 	channelKP, err := keypair.ParseFull(ca.SecretKey)
 	if err != nil {
-		return fmt.Errorf("parsing channel key: %w", err)
+		return nil, fmt.Errorf("parsing channel key: %w", err)
 	}
 
 	starTx, err := e.builder.Build(ctx, PaymentParams{
@@ -122,54 +157,58 @@ func (e *Engine) SubmitProcess(ctx context.Context, tx *state.Transaction) error
 		ChannelAccount: ca.PublicKey,
 		ChannelSeq:     ca.CurrentSeq,
 		MaxLedger:      e.currentLedgerBound(),
-		BaseFee:        e.retryPolicy.CurrentFee(0),
+		BaseFee:        baseFee,
 	})
 	if err != nil {
-		return fmt.Errorf("building transaction: %w", err)
+		return nil, err
 	}
 
-	// Sign with channel account key
 	starTx, err = starTx.Sign(e.networkPass, channelKP)
 	if err != nil {
-		return fmt.Errorf("signing with channel key: %w", err)
+		return nil, fmt.Errorf("signing with channel key: %w", err)
 	}
 
-	// Sign with distribution (source) key if different from channel
 	if tx.SourceAccount != ca.PublicKey {
 		sourceKP, err := keypair.ParseFull(tx.SourceAccount)
 		if err != nil {
-			return fmt.Errorf("parsing source key for dual-sign: %w", err)
+			return nil, fmt.Errorf("parsing source key for dual-sign: %w", err)
 		}
 		starTx, err = starTx.Sign(e.networkPass, sourceKP)
 		if err != nil {
-			return fmt.Errorf("signing with source key: %w", err)
+			return nil, fmt.Errorf("signing with source key: %w", err)
 		}
 	}
 
-	// Submit to Horizon
-	horizonResp, err := e.horizon.SubmitTransaction(starTx)
-	if err != nil {
-		return e.handleSubmissionError(ctx, tx, ca, horizonResp, err)
-	}
-
-	// Record submitted state
-	horizonID := horizonResp.Hash
-	err = e.store.UpdateStatus(ctx, tx.ID, state.StatusSubmitted, "submitted to horizon", &horizonID)
-	if err != nil {
-		return fmt.Errorf("updating status to submitted: %w", err)
-	}
-
-	// Update channel account sequence from the response
-	if ca.CurrentSeq > 0 {
-		_ = e.pool.RefreshSequence(ctx, ca.PublicKey, ca.CurrentSeq)
-	}
-
-	// Poll for inclusion confirmation
-	return e.pollForConfirmation(ctx, tx.ID, ca.PublicKey, horizonID)
+	return starTx, nil
 }
 
-// handleSubmissionError classifies submission errors and attempts fee-bump escalation.
-func (e *Engine) handleSubmissionError(ctx context.Context, tx *state.Transaction, ca *state.ChannelAccount, resp horizon.Transaction, err error) error {
+// isBadSequenceError reports whether a Horizon submission failed because the
+// transaction's sequence number no longer matches the account's on-chain
+// sequence.
+func isBadSequenceError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "tx_bad_seq")
+}
+
+// resyncChannelSequence re-derives a channel account's sequence from Horizon
+// and persists it, returning the sequence to use for the next transaction.
+func (e *Engine) resyncChannelSequence(ctx context.Context, ca *state.ChannelAccount) (int64, error) {
+	detail, err := e.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: ca.PublicKey})
+	if err != nil {
+		return 0, fmt.Errorf("fetching on-chain sequence for %s: %w", ca.PublicKey, err)
+	}
+	nextSeq := detail.Sequence + 1
+	if err := e.pool.RefreshSequence(ctx, ca.PublicKey, nextSeq); err != nil {
+		return 0, fmt.Errorf("persisting resynced sequence for %s: %w", ca.PublicKey, err)
+	}
+	return nextSeq, nil
+}
+
+// handleSubmissionError classifies a submission error and retries accordingly:
+// a stale sequence is corrected by re-deriving the real sequence from Horizon
+// and rebuilding from scratch (a fee-bump can't fix it, since it wraps the
+// same stale inner transaction); anything else retryable escalates the fee
+// via a fee-bump. Exhausting retries routes the transaction to dead-letter.
+func (e *Engine) handleSubmissionError(ctx context.Context, tx *state.Transaction, ca *state.ChannelAccount, err error) error {
 	maxAttempts := e.retryPolicy.MaxAttempts()
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -179,15 +218,41 @@ func (e *Engine) handleSubmissionError(ctx context.Context, tx *state.Transactio
 			return fmt.Errorf("terminal error for tx %s: %w", tx.ID, err)
 		}
 
-		newFee := e.retryPolicy.CurrentFee(attempt)
-		if newFee > e.maxBaseFee {
-			newFee = e.maxBaseFee
-		}
-
-		// Wait backoff before retry
 		backoff := e.retryPolicy.Backoff(attempt)
 		if backoff > 0 {
 			time.Sleep(backoff)
+		}
+
+		if isBadSequenceError(err) {
+			newSeq, syncErr := e.resyncChannelSequence(ctx, ca)
+			if syncErr != nil {
+				e.logger.Warn("resyncing sequence after tx_bad_seq failed", "tx_id", tx.ID, "attempt", attempt, "error", syncErr)
+				err = syncErr
+				continue
+			}
+			ca.CurrentSeq = newSeq
+
+			resubmitTx, buildErr := e.buildSignedPayment(ctx, tx, ca, e.retryPolicy.CurrentFee(attempt))
+			if buildErr != nil {
+				e.logger.Warn("rebuild after sequence resync failed", "tx_id", tx.ID, "attempt", attempt, "error", buildErr)
+				err = buildErr
+				continue
+			}
+
+			resubmitResp, submitErr := e.horizon.SubmitTransaction(resubmitTx)
+			if submitErr != nil {
+				e.logger.Warn("resubmission after sequence resync failed", "tx_id", tx.ID, "attempt", attempt, "error", submitErr)
+				err = submitErr
+				continue
+			}
+
+			horizonID := resubmitResp.Hash
+			return e.store.UpdateStatus(ctx, tx.ID, state.StatusSubmitted, fmt.Sprintf("resubmitted with resynced sequence at attempt %d", attempt), &horizonID)
+		}
+
+		newFee := e.retryPolicy.CurrentFee(attempt)
+		if newFee > e.maxBaseFee {
+			newFee = e.maxBaseFee
 		}
 
 		// Attempt fee-bump retry
