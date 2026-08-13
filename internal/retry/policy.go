@@ -5,6 +5,7 @@ package retry
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -81,7 +82,7 @@ func IsRetryable(err error) bool {
 	}
 
 	for _, code := range terminalCodes {
-		if contains(errStr, code) {
+		if strings.Contains(errStr, code) {
 			return false
 		}
 	}
@@ -103,17 +104,4 @@ func (p *Policy) String() string {
 	curve := p.EscalationCurve()
 	return fmt.Sprintf("Policy{maxAttempts:%d, baseFee:%d, maxFee:%d, curve:%v}",
 		p.maxAttempts, p.baseFee, p.maxFee, curve)
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && findSubstring(s, substr))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
