@@ -86,11 +86,17 @@ func (h *Handlers) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	amount, err := decimal.NewFromString(req.Amount)
+	if err != nil {
+		http.Error(w, "amount must be a valid decimal string", http.StatusBadRequest)
+		return
+	}
+
 	tx, err := h.store.CreateTransaction(r.Context(), state.NewTransactionParams{
 		ExternalID:      req.ExternalID,
 		SourceAccount:   req.Source,
 		Destination:     req.Destination,
-		Amount:          decimalMustParse(req.Amount),
+		Amount:          amount,
 		AssetCode:       req.AssetCode,
 		AssetIssuer:     req.AssetIssuer,
 	})
@@ -160,14 +166,6 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
-}
-
-func decimalMustParse(s string) decimal.Decimal {
-	d, err := decimal.NewFromString(s)
-	if err != nil {
-		panic(err)
-	}
-	return d
 }
 
 func extractIDFromPath(path string) string {
