@@ -46,6 +46,7 @@ func NewEngine(
 	retryPolicy *retry.Policy,
 	networkPassphrase, distribution string,
 	maxBaseFee int64,
+	queuePollingInterval time.Duration,
 	logger *slog.Logger,
 ) (*Engine, error) {
 	kp, err := keypair.ParseFull(distribution)
@@ -63,7 +64,7 @@ func NewEngine(
 		distribution:   distribution,
 		distributionKP: kp,
 		maxBaseFee:     maxBaseFee,
-		pollInterval:   2 * time.Second,
+		pollInterval:   queuePollingInterval,
 		logger:         logger,
 	}, nil
 }
@@ -307,7 +308,7 @@ func (e *Engine) markDeadLetter(ctx context.Context, txID, reason string) {
 
 // Start begins the main submission loop, polling for pending transactions.
 func (e *Engine) Start(ctx context.Context) {
-	ticker := time.NewTicker(6 * time.Second)
+	ticker := time.NewTicker(e.pollInterval)
 	defer ticker.Stop()
 
 	for {

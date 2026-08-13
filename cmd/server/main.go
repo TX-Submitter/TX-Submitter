@@ -128,6 +128,7 @@ func main() {
 		cfg.NetworkPassphrase,
 		cfg.DistributionAccountSecret,
 		cfg.MaxBaseFee,
+		cfg.QueuePollingInterval,
 		logger,
 	)
 	if err != nil {
