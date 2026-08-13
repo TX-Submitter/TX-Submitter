@@ -52,6 +52,12 @@ func bootstrapChannelPool(ctx context.Context, cfg config.Config, pool *channela
 		logger.Warn("syncing channel account sequences failed; some accounts may retain a stale sequence", "error", err)
 	}
 
+	// Clear any locks left over from a previous process. Now that sequences
+	// are freshly synced from chain, every account is safe to hand out again.
+	if err := pool.ResetLocks(ctx); err != nil {
+		return 0, fmt.Errorf("resetting channel account locks: %w", err)
+	}
+
 	// Return final pool size
 	size, err := pool.PoolSize(ctx)
 	if err != nil {

@@ -3,6 +3,7 @@ package channelaccount
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gamp/stellar-tx-submitter/internal/state"
 )
@@ -77,7 +78,7 @@ func (m *testMockStore) DeactivateChannelAccount(ctx context.Context, publicKey 
 func (m *testMockStore) AcquireChannelAccount(ctx context.Context) (*state.ChannelAccount, error) {
 	var best *state.ChannelAccount
 	for _, ca := range m.accounts {
-		if ca.IsActive && (best == nil || ca.CurrentSeq < best.CurrentSeq) {
+		if ca.IsActive && ca.LockedAt == nil && (best == nil || ca.CurrentSeq < best.CurrentSeq) {
 			best = ca
 		}
 	}
@@ -85,7 +86,23 @@ func (m *testMockStore) AcquireChannelAccount(ctx context.Context) (*state.Chann
 		return nil, state.ErrNoChannelAccounts
 	}
 	best.CurrentSeq++
+	now := time.Now()
+	best.LockedAt = &now
 	return best, nil
+}
+func (m *testMockStore) ReleaseChannelAccount(ctx context.Context, publicKey string) error {
+	ca, ok := m.accounts[publicKey]
+	if !ok {
+		return state.ErrNotFound
+	}
+	ca.LockedAt = nil
+	return nil
+}
+func (m *testMockStore) UnlockAllChannelAccounts(ctx context.Context) error {
+	for _, ca := range m.accounts {
+		ca.LockedAt = nil
+	}
+	return nil
 }
 
 func TestPool_Acquire_ReturnsAccount(t *testing.T) {
@@ -133,15 +150,51 @@ func TestPool_Acquire_InactiveSkipped(t *testing.T) {
 func TestPool_Release(t *testing.T) {
 	ctx := context.Background()
 	ms := newTestMockStore()
-	ms.accounts["GACC1"] = &state.ChannelAccount{PublicKey: "GACC1", CurrentSeq: 11, IsActive: true}
+	now := time.Now()
+	ms.accounts["GACC1"] = &state.ChannelAccount{PublicKey: "GACC1", CurrentSeq: 11, IsActive: true, LockedAt: &now}
 
 	pool := New(ms)
 	err := pool.Release(ctx, "GACC1")
 	if err != nil {
 		t.Fatalf("release failed: %v", err)
 	}
-	if ms.accounts["GACC1"].CurrentSeq != 10 {
-		t.Errorf("expected seq 10 after release, got %d", ms.accounts["GACC1"].CurrentSeq)
+	if ms.accounts["GACC1"].LockedAt != nil {
+		t.Error("expected lock cleared after release")
+	}
+	if ms.accounts["GACC1"].CurrentSeq != 11 {
+		t.Errorf("expected seq to remain 11 after release (never rolled back), got %d", ms.accounts["GACC1"].CurrentSeq)
+	}
+}
+
+func TestPool_Acquire_LockedSkipped(t *testing.T) {
+	ctx := context.Background()
+	ms := newTestMockStore()
+	now := time.Now()
+	ms.accounts["GACC1"] = &state.ChannelAccount{PublicKey: "GACC1", CurrentSeq: 5, IsActive: true, LockedAt: &now}
+	ms.accounts["GACC2"] = &state.ChannelAccount{PublicKey: "GACC2", CurrentSeq: 20, IsActive: true}
+
+	pool := New(ms)
+	ca, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire failed: %v", err)
+	}
+	if ca.PublicKey != "GACC2" {
+		t.Errorf("expected the unlocked account GACC2, got %s", ca.PublicKey)
+	}
+}
+
+func TestPool_ResetLocks(t *testing.T) {
+	ctx := context.Background()
+	ms := newTestMockStore()
+	now := time.Now()
+	ms.accounts["GACC1"] = &state.ChannelAccount{PublicKey: "GACC1", IsActive: true, LockedAt: &now}
+
+	pool := New(ms)
+	if err := pool.ResetLocks(ctx); err != nil {
+		t.Fatalf("reset locks failed: %v", err)
+	}
+	if ms.accounts["GACC1"].LockedAt != nil {
+		t.Error("expected lock cleared after ResetLocks")
 	}
 }
 

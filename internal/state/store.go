@@ -76,6 +76,7 @@ type ChannelAccount struct {
 	PublicKey  string
 	CurrentSeq int64
 	IsActive   bool
+	LockedAt   *time.Time
 	CreatedAt  time.Time
 }
 
@@ -102,6 +103,8 @@ type Store interface {
 
 	// Channel account pool
 	AcquireChannelAccount(ctx context.Context) (*ChannelAccount, error)
+	ReleaseChannelAccount(ctx context.Context, publicKey string) error
+	UnlockAllChannelAccounts(ctx context.Context) error
 	CreateChannelAccount(ctx context.Context, secretKey string) (*ChannelAccount, error)
 	ListChannelAccounts(ctx context.Context, activeOnly bool) ([]*ChannelAccount, error)
 	UpdateChannelAccountSeq(ctx context.Context, publicKey string, seq int64) error
@@ -326,17 +329,23 @@ func (s *txStore) MarkChannelUsed(ctx context.Context, txID, channelPublicKey st
 // --- Channel Account Operations ---
 
 const acquireChannelAccountSQL = `
-SELECT id, secret_key, public_key, current_seq, is_active, created_at
+SELECT id, secret_key, public_key, current_seq, is_active, locked_at, created_at
 FROM channel_accounts
-WHERE is_active = true
+WHERE is_active = true AND locked_at IS NULL
 ORDER BY current_seq ASC
 FOR UPDATE SKIP LOCKED
 LIMIT 1`
 
-// AcquireChannelAccount atomically claims the least-recently-used active channel
-// account. The FOR UPDATE SKIP LOCKED clause holds a row lock for the duration
-// of the transaction so concurrent callers skip locked rows and never receive
-// the same account. The sequence is bumped and the lock released on commit.
+const lockChannelAccountSQL = `
+UPDATE channel_accounts SET current_seq = $2, locked_at = now() WHERE public_key = $1`
+
+// AcquireChannelAccount atomically claims the least-recently-used active,
+// unlocked channel account. FOR UPDATE SKIP LOCKED lets concurrent callers
+// skip rows already being claimed instead of blocking on them, and locked_at
+// is set (surviving past this transaction, unlike the row lock) so the
+// account stays claimed for the entire submission — not just the sequence
+// bump — until ReleaseChannelAccount clears it. This is what stops a process
+// restart or a second caller from double-assigning an account still mid-flight.
 func (s *txStore) AcquireChannelAccount(ctx context.Context) (*ChannelAccount, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -347,7 +356,7 @@ func (s *txStore) AcquireChannelAccount(ctx context.Context) (*ChannelAccount, e
 	var ca ChannelAccount
 	err = tx.QueryRow(ctx, acquireChannelAccountSQL).Scan(
 		&ca.ID, &ca.SecretKey, &ca.PublicKey,
-		&ca.CurrentSeq, &ca.IsActive, &ca.CreatedAt,
+		&ca.CurrentSeq, &ca.IsActive, &ca.LockedAt, &ca.CreatedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, ErrNoChannelAccounts
@@ -357,9 +366,9 @@ func (s *txStore) AcquireChannelAccount(ctx context.Context) (*ChannelAccount, e
 	}
 
 	nextSeq := ca.CurrentSeq + 1
-	_, err = tx.Exec(ctx, updateChannelAccountSeqSQL, ca.PublicKey, nextSeq)
+	_, err = tx.Exec(ctx, lockChannelAccountSQL, ca.PublicKey, nextSeq)
 	if err != nil {
-		return nil, fmt.Errorf("bumping channel account sequence: %w", err)
+		return nil, fmt.Errorf("locking channel account: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -370,11 +379,37 @@ func (s *txStore) AcquireChannelAccount(ctx context.Context) (*ChannelAccount, e
 	return &ca, nil
 }
 
+const releaseChannelAccountSQL = `
+UPDATE channel_accounts SET locked_at = NULL WHERE public_key = $1`
+
+// ReleaseChannelAccount frees a channel account for reuse. It deliberately
+// does not touch current_seq: a released account may have just had a
+// transaction submitted under its reserved sequence, and Stellar sequence
+// numbers only ever move forward — rolling the counter back would hand the
+// same sequence to the next caller and guarantee a tx_bad_seq collision.
+func (s *txStore) ReleaseChannelAccount(ctx context.Context, publicKey string) error {
+	_, err := s.pool.Exec(ctx, releaseChannelAccountSQL, publicKey)
+	return err
+}
+
+const unlockAllChannelAccountsSQL = `
+UPDATE channel_accounts SET locked_at = NULL WHERE locked_at IS NOT NULL`
+
+// UnlockAllChannelAccounts clears every lock in the pool. Call once at
+// startup, after sequences have been re-synced from the network: any lock
+// still held from before a restart is stale (its owning process is gone),
+// and the fresh on-chain sequence sync already makes it safe to reuse the
+// account regardless of whether the in-flight transaction landed.
+func (s *txStore) UnlockAllChannelAccounts(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, unlockAllChannelAccountsSQL)
+	return err
+}
+
 const createChannelAccountSQL = `
 INSERT INTO channel_accounts (secret_key, public_key, current_seq)
 VALUES ($1, $2, $3)
 ON CONFLICT (public_key) DO UPDATE SET secret_key = EXCLUDED.secret_key
-RETURNING id, secret_key, public_key, current_seq, is_active, created_at`
+RETURNING id, secret_key, public_key, current_seq, is_active, locked_at, created_at`
 
 func (s *txStore) CreateChannelAccount(ctx context.Context, secretKey string) (*ChannelAccount, error) {
 	kp, err := keypair.ParseFull(secretKey)
@@ -386,7 +421,7 @@ func (s *txStore) CreateChannelAccount(ctx context.Context, secretKey string) (*
 		secretKey, kp.Address(), int64(0),
 	).Scan(
 		&ca.ID, &ca.SecretKey, &ca.PublicKey,
-		&ca.CurrentSeq, &ca.IsActive, &ca.CreatedAt,
+		&ca.CurrentSeq, &ca.IsActive, &ca.LockedAt, &ca.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -395,9 +430,9 @@ func (s *txStore) CreateChannelAccount(ctx context.Context, secretKey string) (*
 }
 
 const listChannelAccountsSQL = `
-SELECT id, secret_key, public_key, current_seq, is_active, created_at
+SELECT id, secret_key, public_key, current_seq, is_active, locked_at, created_at
 FROM channel_accounts
-WHERE $1 = true OR is_active = true
+WHERE $1 = false OR is_active = true
 ORDER BY created_at ASC`
 
 func (s *txStore) ListChannelAccounts(ctx context.Context, activeOnly bool) ([]*ChannelAccount, error) {
@@ -411,7 +446,7 @@ func (s *txStore) ListChannelAccounts(ctx context.Context, activeOnly bool) ([]*
 	for rows.Next() {
 		var ca ChannelAccount
 		err := rows.Scan(&ca.ID, &ca.SecretKey, &ca.PublicKey,
-			&ca.CurrentSeq, &ca.IsActive, &ca.CreatedAt)
+			&ca.CurrentSeq, &ca.IsActive, &ca.LockedAt, &ca.CreatedAt)
 		if err != nil {
 			return nil, err
 		}

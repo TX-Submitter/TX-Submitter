@@ -176,3 +176,9 @@ func (m *testStore) DeactivateChannelAccount(ctx context.Context, publicKey stri
 func (m *testStore) AcquireChannelAccount(ctx context.Context) (*state.ChannelAccount, error) {
 	return nil, state.ErrNoChannelAccounts
 }
+func (m *testStore) ReleaseChannelAccount(ctx context.Context, publicKey string) error {
+	return nil
+}
+func (m *testStore) UnlockAllChannelAccounts(ctx context.Context) error {
+	return nil
+}

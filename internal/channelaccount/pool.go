@@ -33,29 +33,23 @@ func (p *Pool) Acquire(ctx context.Context) (*state.ChannelAccount, error) {
 	return ca, nil
 }
 
-// Release marks a channel account as available for reuse.
-// The account's sequence is rolled back to allow future submissions.
+// Release marks a channel account as available for reuse. It only clears the
+// lock set by Acquire — current_seq is never rolled back here, since a
+// released account may have just had a transaction submitted under its
+// reserved sequence and Stellar sequence numbers only ever move forward.
 func (p *Pool) Release(ctx context.Context, publicKey string) error {
-	// Read current sequence
-	accounts, err := p.store.ListChannelAccounts(ctx, false)
-	if err != nil {
-		return fmt.Errorf("listing accounts: %w", err)
+	if err := p.store.ReleaseChannelAccount(ctx, publicKey); err != nil {
+		return fmt.Errorf("releasing channel account %s: %w", publicKey, err)
 	}
+	return nil
+}
 
-	for _, ca := range accounts {
-		if ca.PublicKey == publicKey {
-			// Decrement to free the slot
-			if ca.CurrentSeq > 0 {
-				newSeq := ca.CurrentSeq - 1
-				err := p.store.UpdateChannelAccountSeq(ctx, publicKey, newSeq)
-				if err != nil {
-					return fmt.Errorf("rolling back sequence: %w", err)
-				}
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("channel account %s not found", publicKey)
+// ResetLocks clears every lock in the pool. Call once at startup, after
+// sequences have been re-synced from the network: a lock still held from
+// before a restart belongs to a process that no longer exists, and the fresh
+// sequence sync already makes the account safe to hand out again.
+func (p *Pool) ResetLocks(ctx context.Context) error {
+	return p.store.UnlockAllChannelAccounts(ctx)
 }
 
 // RefreshSequence updates the channel account's sequence to the latest
